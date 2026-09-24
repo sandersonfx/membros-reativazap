@@ -36,6 +36,23 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "https://membros.reativazap.com")
 app = FastAPI(title="Área de Membros ReativaZap")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# Rotas do SITE (auth própria + /api/db + /api/media) vindas de membros_api.
+# Registradas ANTES das rotas antigas de propósito: /auth/login e /auth/trocar-senha
+# existem nos dois fluxos e a nova precisa ganhar. O fluxo antigo (tabela `alunas`,
+# senha temporária por WhatsApp) continua atendido — membros_api sabe migrar a aluna.
+from membros_api import router as site_router, criar_tabelas as _criar_tabelas_site, \
+    aplicar_compra as _aplicar_compra_site
+app.include_router(site_router)
+
+
+@app.on_event("startup")
+def _boot_site():
+    """Garante as tabelas do site no boot. Nunca apaga nada das tabelas antigas."""
+    try:
+        _criar_tabelas_site()
+    except Exception as erro:
+        logger.error("nao consegui garantir as tabelas do site: %s", erro)
+
 
 def db():
     return psycopg2.connect(DB_DSN, cursor_factory=psycopg2.extras.RealDictCursor)
@@ -316,6 +333,14 @@ async def webhook_cakto(request: Request):
                 )
             conn.commit()
 
+        # libera/revoga no banco do SITE (courses/enrollments) pelo email do comprador
+        try:
+            info_cakto = _interpretar_compra(payload)
+            if info_cakto.get("email"):
+                logger.info("CAKTO aplicado no site: %s", _aplicar_compra_site(info_cakto))
+        except Exception:
+            logger.exception("falha ao aplicar a compra do Cakto no banco do site")
+
         return {"ok": True}
     finally:
         conn.close()
@@ -505,10 +530,20 @@ async def webhook_onprofit(request: Request):
 
     curso = None          # liga quando houver mapa oferta -> curso
     aplicado = False      # gravacao no banco do site
+    detalhe = "nada a fazer"
+    if info["decisao"] in ("liberar", "revogar"):
+        try:
+            resultado = _aplicar_compra_site(info)
+            aplicado = bool(resultado.get("aplicado"))
+            curso = resultado.get("cursos")
+            detalhe = resultado.get("motivo") or "ok"
+            logger.info("ONPROFIT aplicado no site: %s", resultado)
+        except Exception as erro:
+            logger.exception("falha ao aplicar a compra no banco do site")
+            detalhe = "erro ao gravar: %s" % str(erro)[:150]
     return {"ok": True, "recebido": True, "status": info["status"], "decisao": info["decisao"],
             "email": info["email"], "nome": info["nome"], "oferta": info["oferta"],
-            "curso": curso, "aplicado": aplicado,
-            "nota": "decisao calculada; gravacao liga quando SUPABASE_SERVICE_ROLE_KEY existir"}
+            "curso": curso, "aplicado": aplicado, "detalhe": detalhe}
 
 
 @app.get("/webhook/onprofit/ultimo")
