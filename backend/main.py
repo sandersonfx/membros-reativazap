@@ -421,11 +421,6 @@ def admin_overview(key: str = Query(...)):
         conn.close()
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8200)))
-
-
 # ── Webhook de compra (OnProfit / Cakto) — libera acesso pelo EMAIL ──────────
 ONPROFIT_WEBHOOK_SECRET = os.getenv("ONPROFIT_WEBHOOK_SECRET", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -493,3 +488,8 @@ async def webhook_onprofit(request: Request):
 def onprofit_ultimo(key: str = Query(...)):
     _checar_admin(key)
     return _ULTIMO_PAYLOAD or {"vazio": True}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8200)))
