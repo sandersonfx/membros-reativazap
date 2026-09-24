@@ -424,3 +424,72 @@ def admin_overview(key: str = Query(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8200)))
+
+
+# ── Webhook de compra (OnProfit / Cakto) — libera acesso pelo EMAIL ──────────
+ONPROFIT_WEBHOOK_SECRET = os.getenv("ONPROFIT_WEBHOOK_SECRET", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+_ULTIMO_PAYLOAD = {}
+
+
+def _achar(d, alvos):
+    """Procura recursivamente a 1a chave que casa com algum alvo (payload tolerante)."""
+    if isinstance(d, dict):
+        for k, v in d.items():
+            kl = str(k).lower()
+            for a in alvos:
+                if a in kl and not isinstance(v, (dict, list)):
+                    return v
+        for v in d.values():
+            r = _achar(v, alvos)
+            if r is not None:
+                return r
+    elif isinstance(d, list):
+        for v in d:
+            r = _achar(v, alvos)
+            if r is not None:
+                return r
+    return None
+
+
+@app.get("/webhook/onprofit")
+def onprofit_info():
+    return {"ok": True, "rota": "/webhook/onprofit", "metodo": "POST",
+            "status": "pronto para receber o teste"}
+
+
+@app.post("/webhook/onprofit")
+async def webhook_onprofit(request: Request):
+    raw = await request.body()
+    ct = (request.headers.get("content-type") or "").lower()
+    import json as _json
+    from urllib.parse import parse_qs
+    payload = {}
+    try:
+        if "form" in ct and "json" not in ct:
+            payload = {k: (v[0] if len(v) == 1 else v)
+                       for k, v in parse_qs(raw.decode("utf-8", "replace")).items()}
+        elif raw:
+            payload = _json.loads(raw)
+    except Exception:
+        payload = {"__bruto__": raw.decode("utf-8", "replace")[:4000]}
+
+    logger.info("ONPROFIT payload recebido: %s", _json.dumps(payload, ensure_ascii=False)[:5000])
+    _ULTIMO_PAYLOAD.clear()
+    _ULTIMO_PAYLOAD.update({"payload": payload, "content_type": ct})
+
+    email = str(_achar(payload, ["email", "mail"]) or "")
+    nome = str(_achar(payload, ["name", "nome"]) or "")
+    evento = str(_achar(payload, ["event", "evento", "status", "type"]) or "")
+    produto = str(_achar(payload, ["product", "produto", "offer", "plan", "item", "curso"]) or "")
+
+    return {"ok": True, "recebido": True, "evento": evento[:100], "email": email[:140],
+            "nome": nome[:100], "produto": str(produto)[:100],
+            "nota": "payload completo registrado no log do container"}
+
+
+@app.get("/webhook/onprofit/ultimo")
+def onprofit_ultimo(key: str = Query(...)):
+    _checar_admin(key)
+    return _ULTIMO_PAYLOAD or {"vazio": True}
