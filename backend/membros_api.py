@@ -560,8 +560,20 @@ def aplicar_compra(info):
                 cur.execute("SELECT course_id FROM mapa_ofertas WHERE oferta = %s", (chave,))
                 course_ids += [str(l["course_id"]) for l in cur.fetchall()]
             if not course_ids:
-                logger.warning("compra %s: oferta(s) %s sem mapa -> curso", decisao, chaves)
-                return {"aplicado": False, "motivo": "oferta sem mapa para curso", "ofertas": chaves}
+                # Sem mapa cadastrado: se existe UM UNICO curso publicado, a compra vale para ele.
+                # Assim o gateway funciona sem depender do offer_hash quando so ha um curso.
+                cur.execute("SELECT id FROM courses WHERE is_published "
+                            "ORDER BY position, created_at LIMIT 2")
+                publicados = cur.fetchall()
+                if len(publicados) == 1:
+                    course_ids = [str(publicados[0]["id"])]
+                    logger.info("compra %s: sem mapa; aplicando no unico curso publicado %s",
+                                decisao, course_ids[0])
+                else:
+                    logger.warning("compra %s: oferta(s) %s sem mapa -> curso (%d curso(s) publicado(s))",
+                                   decisao, chaves, len(publicados))
+                    return {"aplicado": False, "motivo": "oferta sem mapa para curso",
+                            "ofertas": chaves, "cursos_publicados": len(publicados)}
 
             linha = _usuario_por_email(cur, email)
             if decisao == "liberar":
