@@ -242,7 +242,11 @@ def _monta_usuario(cur, linha):
 
 
 def usuario_do_token(authorization):
-    """Usuário autenticado ou None. Aceita também o token do fluxo antigo."""
+    """Usuário autenticado ou None. Aceita também o token do fluxo antigo.
+
+    Sonda de autenticação NUNCA pode virar 500: erro inesperado vira None (o
+    chamador responde 401) e o motivo fica no log.
+    """
     if not authorization or not authorization.lower().startswith("bearer "):
         return None
     token = authorization.split(" ", 1)[1].strip()
@@ -259,7 +263,14 @@ def usuario_do_token(authorization):
             u = cur.fetchone()
             if u:
                 return _monta_usuario(cur, u)
-            return _migrar_sessao_antiga(cur, conn, token)
+            try:
+                return _migrar_sessao_antiga(cur, conn, token)
+            except Exception as erro:
+                logger.warning("token nao resolvido no fluxo antigo: %s", erro)
+                return None
+    except Exception as erro:
+        logger.warning("falha ao validar token: %s", erro)
+        return None
     finally:
         conn.close()
 
@@ -309,6 +320,29 @@ def _buscar_aluna(ident):
         return None
     finally:
         conn.close()
+
+
+def _migrar_sessao_antiga(cur, conn, token):
+    """Token do fluxo antigo (`sessoes` + `alunas`) vale também no site novo.
+
+    Só migra quem tem email — sem email não há como casar o acesso.
+    """
+    try:
+        cur.execute(
+            """SELECT a.* FROM sessoes s JOIN alunas a ON a.id = s.aluna_id
+               WHERE s.token = %s AND s.expira_em > now()""",
+            (token,),
+        )
+        aluna = cur.fetchone()
+    except Exception as erro:
+        logger.info("token antigo nao conferido: %s", str(erro).split("\n")[0][:120])
+        return None
+    if not aluna:
+        return None
+    return _usuario_por_email_ou_cria(
+        cur, conn, aluna.get("email"), aluna.get("nome") or "",
+        aluna.get("senha_hash"), "student", bool(aluna.get("precisa_trocar_senha")),
+    )
 
 
 def _sincronizar_aluna(email, senha_hash):
@@ -862,6 +896,28 @@ def media_get(tipo: str, id: str):
         raise HTTPException(status_code=404, detail="sem imagem")
     return Response(content=bytes(linha["bytes"]), media_type=linha["mime"] or "image/jpeg",
                     headers={"Cache-Control": "public, max-age=86400"})
+
+
+@router.delete("/api/media/{tipo}/{id}")
+def media_apagar(tipo: str, id: str, authorization: str = Header(None)):
+    """Tira a imagem do banco e limpa a coluna que apontava pra ela."""
+    usuario = _exige_usuario(authorization)
+    alvo = ALVOS_MIDIA.get((tipo or "").lower())
+    if not alvo:
+        raise HTTPException(status_code=400, detail="tipo invalido")
+    tabela, coluna = alvo
+    if not usuario.get("is_admin") and not (tabela == "profiles" and str(id) == usuario["id"]):
+        raise HTTPException(status_code=403, detail="somente admin")
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM midias WHERE tipo = %s AND ref_id = %s", ((tipo or "").lower(), id))
+            removidas = cur.rowcount
+            cur.execute('UPDATE %s SET "%s" = NULL, updated_at = NOW() WHERE id = %%s' % (tabela, coluna), (id,))
+        conn.commit()
+        return {"ok": True, "removidas": removidas}
+    finally:
+        conn.close()
 
 
 # ── admin ────────────────────────────────────────────────────────────────────
