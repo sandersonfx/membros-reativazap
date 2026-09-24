@@ -565,8 +565,9 @@ def _escopo_aluno(tabela, usuario):
     if tabela == "user_roles":
         return ["user_id = %s"], [me]
     if tabela == "courses":
-        return ["(is_published AND (show_in_catalog OR id IN "
-                "(SELECT course_id FROM enrollments WHERE user_id = %s)))"], [me]
+        # catálogo público OU curso que ele comprou (comprado vale mesmo fora do catálogo)
+        return ["((is_published AND show_in_catalog) OR id IN "
+                "(SELECT course_id FROM enrollments WHERE user_id = %s))"], [me]
     if tabela == "modules":
         return ["course_id IN (SELECT course_id FROM enrollments WHERE user_id = %s)"], [me]
     if tabela == "lessons":
