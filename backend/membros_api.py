@@ -883,12 +883,14 @@ async def media_upload(tipo: str = Form(...), id: str = Form(...),
                         (tipo.lower(), str(id), psycopg2.Binary(dados), mime))
             cur.execute('UPDATE %s SET "%s" = %%s, updated_at = NOW() WHERE id = %%s' % (tabela, coluna),
                         (url, str(id)))
-            if not cur.rowcount:
-                conn.rollback()
-                raise HTTPException(status_code=404, detail="registro nao encontrado para o id informado")
+            vinculado = bool(cur.rowcount)
         conn.commit()
+        if not vinculado:
+            # Imagem escolhida antes de o curso/modulo/aula existir (criacao no painel):
+            # o arquivo fica guardado em `midias` e passa a ser servido por /api/media/{tipo}/{id}.
+            logger.info("midia %s %s sem registro correspondente (criacao em andamento)", tipo, id)
         logger.info("midia gravada: %s %s (%d bytes, %s)", tipo, id, len(dados), mime)
-        return {"ok": True, "url": url, "bytes": len(dados), "mime": mime}
+        return {"ok": True, "url": url, "bytes": len(dados), "mime": mime, "vinculado": vinculado}
     finally:
         conn.close()
 
