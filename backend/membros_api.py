@@ -657,10 +657,16 @@ async def api_db(tabela: str, request: Request, authorization: str = Header(None
                 linhas = cur.fetchall()
                 return {"dados": _embutir(cur, tabela, linhas, request.query_params.get("embed"))}
 
-            corpo = await request.json()
-            linhas_corpo = corpo if isinstance(corpo, list) else [corpo]
-            if not linhas_corpo or not all(isinstance(l, dict) for l in linhas_corpo):
-                raise HTTPException(status_code=400, detail="corpo invalido")
+            if metodo == "DELETE":
+                linhas_corpo = [{}]          # DELETE não tem corpo
+            else:
+                try:
+                    corpo = await request.json()
+                except Exception:
+                    corpo = {}
+                linhas_corpo = corpo if isinstance(corpo, list) else [corpo]
+                if not linhas_corpo or not all(isinstance(l, dict) for l in linhas_corpo):
+                    raise HTTPException(status_code=400, detail="corpo invalido")
 
             on_conflict = request.query_params.get("on_conflict")
             if on_conflict:
