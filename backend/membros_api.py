@@ -25,7 +25,7 @@ from uuid import UUID
 import bcrypt
 import psycopg2
 import psycopg2.extras
-from fastapi import APIRouter, HTTPException, Request, Header, Form, UploadFile, File
+from fastapi import APIRouter, HTTPException, Request, Header, Query, Form, UploadFile, File
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -34,6 +34,7 @@ logger = logging.getLogger("membros")
 router = APIRouter()
 
 SESSION_DAYS = int(os.getenv("SESSION_DAYS", "30"))
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
 ID_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 MAX_BYTES = int(os.getenv("MEDIA_MAX_BYTES", str(8 * 1024 * 1024)))
 ADMIN_EMAILS = [e.strip().lower() for e in
@@ -991,6 +992,29 @@ def admin_usuarios(authorization: str = Header(None)):
                                   (SELECT COUNT(*) FROM enrollments e WHERE e.user_id = p.id) AS cursos
                            FROM profiles p ORDER BY p.created_at DESC""")
             return {"usuarios": cur.fetchall()}
+    finally:
+        conn.close()
+
+
+@router.post("/admin/conceder-admin")
+def conceder_admin(email: str = Query(...), key: str = Query(...)):
+    """Recuperação de acesso: promove `email` a admin usando ADMIN_SECRET.
+
+    Mesmo segredo dos /admin antigos do backend. Existe pro caso "trancou o acesso e
+    não há nenhum admin no banco" — sem isso só sobraria mexer no banco na mão.
+    """
+    if not ADMIN_SECRET or key != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="acesso negado")
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            linha = _usuario_por_email(cur, email)
+            if not linha:
+                raise HTTPException(status_code=404, detail="nao existe conta com esse email")
+            _conceder_papel(cur, linha["id"], "admin")
+        conn.commit()
+        logger.info("papel admin concedido (recuperacao): %s", (email or "").lower())
+        return {"ok": True, "email": (email or "").lower(), "papel": "admin"}
     finally:
         conn.close()
 
