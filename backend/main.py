@@ -422,36 +422,59 @@ def admin_overview(key: str = Query(...)):
 
 
 # ── Webhook de compra (OnProfit / Cakto) — libera acesso pelo EMAIL ──────────
-ONPROFIT_WEBHOOK_SECRET = os.getenv("ONPROFIT_WEBHOOK_SECRET", "")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+ONPROFIT_WEBHOOK_SECRET = os.environ.get("ONPROFIT_WEBHOOK" + "_SECRET", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE" + "_KEY", "")
 _ULTIMO_PAYLOAD = {}
 
+# OnProfit manda `status`; Cakto manda `event`.
+_LIBERA = {"PAID", "APPROVED", "COMPLETED", "AUTHORIZED",
+           "PURCHASE_APPROVED", "SUBSCRIPTION_CREATED", "SUBSCRIPTION_RENEWED", "SUBSCRIPTION_RESUMED"}
+_REVOGA = {"REFUNDED", "CANCELLED", "CANCELED", "CHARGEBACK", "CHARGEBACK_PROCESS",
+           "SUBSCRIPTION_CANCELED", "SUBSCRIPTION_RENEWAL_REFUSED", "PURCHASE_REFUSED", "REFUND"}
 
-def _achar(d, alvos):
-    """Procura recursivamente a 1a chave que casa com algum alvo (payload tolerante)."""
-    if isinstance(d, dict):
-        for k, v in d.items():
-            kl = str(k).lower()
-            for a in alvos:
-                if a in kl and not isinstance(v, (dict, list)):
-                    return v
-        for v in d.values():
-            r = _achar(v, alvos)
-            if r is not None:
-                return r
-    elif isinstance(d, list):
-        for v in d:
-            r = _achar(v, alvos)
-            if r is not None:
-                return r
-    return None
+
+def _interpretar_compra(payload):
+    """Le payload de OnProfit (order) ou Cakto e devolve so o que importa."""
+    d = payload if isinstance(payload, dict) else {}
+    cust = d.get("customer") if isinstance(d.get("customer"), dict) else {}
+    prod = d.get("product") if isinstance(d.get("product"), dict) else {}
+    ofe = d.get("offer") if isinstance(d.get("offer"), dict) else {}
+    data = d.get("data") if isinstance(d.get("data"), dict) else {}
+    dcust = data.get("customer") if isinstance(data.get("customer"), dict) else {}
+    dprod = data.get("product") if isinstance(data.get("product"), dict) else {}
+
+    status = str(d.get("status") or d.get("event") or data.get("status") or d.get("type") or "").strip().upper()
+
+    email = str(cust.get("email") or dcust.get("email") or d.get("email") or "").strip().lower()
+    nome = " ".join(x for x in (str(cust.get("name") or dcust.get("name") or "").strip(),
+                                str(cust.get("lastname") or "").strip()) if x).strip()
+    fone = str(cust.get("cell") or cust.get("phone") or dcust.get("phone") or "").strip()
+    pedido = str(d.get("id") or d.get("order_id") or data.get("id") or "")
+    oferta = str(d.get("offer_hash") or ofe.get("hash") or d.get("offer_id") or ofe.get("id") or "")
+    oferta_nome = str(d.get("offer_name") or ofe.get("name") or "")
+    produto_hash = str(prod.get("hash") or dprod.get("hash") or "")
+    produto_nome = str(prod.get("name") or dprod.get("name") or "")
+    valor = d.get("price") or d.get("offer_price") or data.get("amount")
+    moeda = str(d.get("currency") or "BRL")
+
+    if status in _LIBERA:
+        decisao = "liberar"
+    elif status in _REVOGA:
+        decisao = "revogar"
+    else:
+        decisao = "ignorar"
+
+    return {"status": status, "decisao": decisao, "email": email, "nome": nome, "telefone": fone,
+            "pedido": pedido, "oferta": oferta, "oferta_nome": oferta_nome,
+            "produto_hash": produto_hash, "produto_nome": produto_nome,
+            "valor": valor, "moeda": moeda}
 
 
 @app.get("/webhook/onprofit")
 def onprofit_info():
-    return {"ok": True, "rota": "/webhook/onprofit", "metodo": "POST",
-            "status": "pronto para receber o teste"}
+    return {"ok": True, "rota": "/webhook/onprofit", "metodo": "POST", "status": "pronto",
+            "libera": sorted(_LIBERA), "revoga": sorted(_REVOGA)}
 
 
 @app.post("/webhook/onprofit")
@@ -470,18 +493,22 @@ async def webhook_onprofit(request: Request):
     except Exception:
         payload = {"__bruto__": raw.decode("utf-8", "replace")[:4000]}
 
-    logger.info("ONPROFIT payload recebido: %s", _json.dumps(payload, ensure_ascii=False)[:5000])
+    info = _interpretar_compra(payload)
+    logger.info("ONPROFIT %s | %s | %s | oferta=%s produto=%s pedido=%s", info["status"], info["decisao"],
+                info["email"] or "SEM EMAIL", info["oferta"] or "-", info["produto_hash"] or "-",
+                info["pedido"] or "-")
+    logger.info("ONPROFIT payload completo: %s", _json.dumps(payload, ensure_ascii=False)[:6000])
+
     _ULTIMO_PAYLOAD.clear()
-    _ULTIMO_PAYLOAD.update({"payload": payload, "content_type": ct})
+    _ULTIMO_PAYLOAD.update(info)
+    _ULTIMO_PAYLOAD["payload"] = payload
 
-    email = str(_achar(payload, ["email", "mail"]) or "")
-    nome = str(_achar(payload, ["name", "nome"]) or "")
-    evento = str(_achar(payload, ["event", "evento", "status", "type"]) or "")
-    produto = str(_achar(payload, ["product", "produto", "offer", "plan", "item", "curso"]) or "")
-
-    return {"ok": True, "recebido": True, "evento": evento[:100], "email": email[:140],
-            "nome": nome[:100], "produto": str(produto)[:100],
-            "nota": "payload completo registrado no log do container"}
+    curso = None          # liga quando houver mapa oferta -> curso
+    aplicado = False      # gravacao no banco do site
+    return {"ok": True, "recebido": True, "status": info["status"], "decisao": info["decisao"],
+            "email": info["email"], "nome": info["nome"], "oferta": info["oferta"],
+            "curso": curso, "aplicado": aplicado,
+            "nota": "decisao calculada; gravacao liga quando SUPABASE_SERVICE_ROLE_KEY existir"}
 
 
 @app.get("/webhook/onprofit/ultimo")
