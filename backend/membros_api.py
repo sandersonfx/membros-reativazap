@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS courses (
   is_published BOOLEAN NOT NULL DEFAULT FALSE,
   show_in_catalog BOOLEAN NOT NULL DEFAULT TRUE,
   liberado_para_todos BOOLEAN NOT NULL DEFAULT FALSE,
+  secao TEXT NOT NULL DEFAULT '',
   position INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -175,6 +176,7 @@ CREATE TABLE IF NOT EXISTS banners (
 );
 ALTER TABLE courses  ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE courses  ADD COLUMN IF NOT EXISTS liberado_para_todos BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE courses  ADD COLUMN IF NOT EXISTS secao TEXT NOT NULL DEFAULT '';
 ALTER TABLE lessons  ADD COLUMN IF NOT EXISTS is_free BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE lessons  ADD COLUMN IF NOT EXISTS materials TEXT NOT NULL DEFAULT '[]';
 """
@@ -928,7 +930,9 @@ async def media_upload(tipo: str = Form(...), id: str = Form(...),
     except Exception:
         raise HTTPException(status_code=422, detail="id invalido")
     mime = _mime(dados, upload.content_type)
-    url = "/api/media/%s/%s" % (tipo.lower(), id)
+    # A URL carrega a versao do envio. Sem isso a imagem fica gravada na MESMA URL e o
+    # navegador segue mostrando a antiga por 24h (parecia que a troca de capa nao funcionava).
+    url = "/api/media/%s/%s?v=%d" % (tipo.lower(), id, int(time.time()))
     conn = db()
     try:
         with conn.cursor() as cur:
@@ -952,7 +956,7 @@ async def media_upload(tipo: str = Form(...), id: str = Form(...),
 
 
 @router.get("/api/media/{tipo}/{id}")
-def media_get(tipo: str, id: str):
+def media_get(tipo: str, id: str, v: str = Query(None)):
     conn = db()
     try:
         with conn.cursor() as cur:
@@ -965,8 +969,11 @@ def media_get(tipo: str, id: str):
         conn.close()
     if not linha or not linha["bytes"]:
         raise HTTPException(status_code=404, detail="sem imagem")
+    # URL com versao pode ser guardada para sempre (cada envio muda a URL).
+    # URL antiga (sem versao) precisa revalidar, senao a troca nao aparece na tela.
+    cache = "public, max-age=31536000, immutable" if v else "public, max-age=0, must-revalidate"
     return Response(content=bytes(linha["bytes"]), media_type=linha["mime"] or "image/jpeg",
-                    headers={"Cache-Control": "public, max-age=86400"})
+                    headers={"Cache-Control": cache})
 
 
 @router.delete("/api/media/{tipo}/{id}")
