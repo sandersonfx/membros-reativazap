@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS courses (
   checkout_url TEXT,
   is_published BOOLEAN NOT NULL DEFAULT FALSE,
   show_in_catalog BOOLEAN NOT NULL DEFAULT TRUE,
+  liberado_para_todos BOOLEAN NOT NULL DEFAULT FALSE,
   position INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -173,6 +174,7 @@ CREATE TABLE IF NOT EXISTS banners (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ALTER TABLE courses  ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE courses  ADD COLUMN IF NOT EXISTS liberado_para_todos BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE lessons  ADD COLUMN IF NOT EXISTS is_free BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE lessons  ADD COLUMN IF NOT EXISTS materials TEXT NOT NULL DEFAULT '[]';
 """
@@ -631,10 +633,13 @@ def _escopo_aluno(tabela, usuario):
         return ["((is_published AND show_in_catalog) OR id IN "
                 "(SELECT course_id FROM enrollments WHERE user_id = %s))"], [me]
     if tabela == "modules":
-        return ["course_id IN (SELECT course_id FROM enrollments WHERE user_id = %s)"], [me]
+        # curso liberado para todos dispensa compra; o resto continua so para quem tem matricula
+        return ["(course_id IN (SELECT id FROM courses WHERE liberado_para_todos) OR "
+                "course_id IN (SELECT course_id FROM enrollments WHERE user_id = %s))"], [me]
     if tabela == "lessons":
-        return ["module_id IN (SELECT m.id FROM modules m JOIN enrollments e "
-                "ON e.course_id = m.course_id WHERE e.user_id = %s)"], [me]
+        return ["module_id IN (SELECT m.id FROM modules m WHERE "
+                "m.course_id IN (SELECT id FROM courses WHERE liberado_para_todos) OR "
+                "m.course_id IN (SELECT course_id FROM enrollments WHERE user_id = %s))"], [me]
     if tabela == "enrollments":
         return ["user_id = %s"], [me]
     if tabela == "lesson_progress":
