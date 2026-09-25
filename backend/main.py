@@ -484,6 +484,19 @@ def _interpretar_compra(payload):
     valor = d.get("price") or d.get("offer_price") or data.get("amount")
     moeda = str(d.get("currency") or "BRL")
 
+    # Pistas de vínculo: se o link de compra saiu marcado (a área de membros já põe UTMs no
+    # checkout), o próprio pedido carrega de qual curso é. É o caminho para vincular sozinho,
+    # sem ninguém escolher nada no painel.
+    dicas = []
+    for fonte in (d, data, d.get("metadata"), data.get("metadata"), d.get("utm"), data.get("utm")):
+        if isinstance(fonte, dict):
+            for chave, valor_dica in fonte.items():
+                alvo = str(chave).lower()
+                if alvo.startswith("utm_") or alvo in (
+                        "src", "sck", "ref", "tracking", "curso", "course", "course_id", "slug"):
+                    if valor_dica:
+                        dicas.append(str(valor_dica).strip())
+
     if status in _LIBERA:
         decisao = "liberar"
     elif status in _REVOGA:
@@ -494,7 +507,7 @@ def _interpretar_compra(payload):
     return {"status": status, "decisao": decisao, "email": email, "nome": nome, "telefone": fone,
             "pedido": pedido, "oferta": oferta, "oferta_nome": oferta_nome,
             "produto_hash": produto_hash, "produto_nome": produto_nome,
-            "valor": valor, "moeda": moeda}
+            "valor": valor, "moeda": moeda, "dicas": dicas}
 
 
 @app.get("/webhook/onprofit")

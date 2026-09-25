@@ -606,6 +606,68 @@ def _liberar_pendentes(cur, email, user_id):
     return len(liberados)
 
 
+def _normalizar_texto(valor):
+    """Só letras/números, para comparar nomes sem tropeçar em acento, hífen e caixa."""
+    return re.sub(r"[^a-z0-9]+", " ", (valor or "").lower()).strip()
+
+
+def _cursos_por_dica(cur, dicas):
+    """Curso identificado por um valor que veio no próprio pedido (link de compra marcado).
+
+    A área de membros já marca o checkout com `utm_campaign=<slug do curso>`; se o gateway
+    devolver esse campo no webhook, o vínculo sai sozinho, sem ninguém escolher nada.
+    """
+    achados = []
+    for dica in dicas or []:
+        valor = (dica or "").strip()
+        if not valor:
+            continue
+        linhas = []
+        try:
+            UUID(valor)
+            cur.execute("SELECT id, title FROM courses WHERE id = %s", (valor,))
+            linhas = cur.fetchall()
+        except Exception:
+            linhas = []
+        if not linhas:
+            cur.execute("SELECT id, title FROM courses WHERE slug = %s", (valor,))
+            linhas = cur.fetchall()
+        if not linhas:
+            # UTM costuma vir com enfeite ("slug-vitrine"): só aceita se casar UM curso
+            cur.execute("SELECT id, title FROM courses WHERE %s LIKE slug || '%%'", (valor,))
+            candidatos = cur.fetchall()
+            linhas = candidatos if len(candidatos) == 1 else []
+        for linha in linhas:
+            if str(linha["id"]) not in [a["id"] for a in achados]:
+                achados.append({"id": str(linha["id"]), "title": linha["title"]})
+    return achados
+
+
+def _cursos_por_nome(cur, nomes):
+    """Cursos cujo título casa com o nome do produto/oferta que o gateway mandou."""
+    cur.execute("SELECT id, title FROM courses")
+    cursos = cur.fetchall()
+    achados = []
+    for nome in nomes:
+        alvo = _normalizar_texto(nome)
+        if len(alvo) < 8:          # nome curto demais casa com qualquer coisa
+            continue
+        for curso in cursos:
+            titulo = _normalizar_texto(curso["title"])
+            if titulo and (titulo == alvo or alvo in titulo or titulo in alvo):
+                if str(curso["id"]) not in [a["id"] for a in achados]:
+                    achados.append({"id": str(curso["id"]), "title": curso["title"]})
+    return achados
+
+
+def _vincular(cur, chaves, achados):
+    """Grava o vínculo descoberto automaticamente (aparece no painel como qualquer outro)."""
+    for chave in chaves:
+        for achado in achados:
+            cur.execute("INSERT INTO mapa_ofertas (oferta, course_id) VALUES (%s, %s) "
+                        "ON CONFLICT DO NOTHING", (chave, achado["id"]))
+
+
 def _cursos_da_oferta(cur, chaves):
     """Cursos ligados a quaisquer chaves (oferta/produto) do payload, sem repetir."""
     ids, vistos = [], set()
@@ -670,7 +732,24 @@ def aplicar_compra(info):
             else:
                 course_ids = _cursos_da_oferta(cur, chaves)
                 if not course_ids:
-                    # Sem vínculo: se existe UM ÚNICO curso publicado, a compra vale para ele.
+                    # ── vínculo automático ──
+                    # 1) o próprio pedido diz o curso (link marcado com UTM/slug/id)
+                    por_dica = _cursos_por_dica(cur, info.get("dicas") or [])
+                    if por_dica:
+                        achados, como = por_dica, "vinculado automaticamente pelo link de compra"
+                    else:
+                        # 2) nome do produto/oferta igual ao título do curso (só se for ÚNICO)
+                        nomes = [info.get("produto_nome"), info.get("oferta_nome")]
+                        candidatos = _cursos_por_nome(cur, nomes)
+                        achados = candidatos if len(candidatos) == 1 else []
+                        como = "vinculado automaticamente pelo nome do produto"
+                    if achados:
+                        _vincular(cur, chaves, achados)
+                        course_ids = [a["id"] for a in achados]
+                        motivo = como
+                        logger.info("compra %s: %s -> %s", decisao, como, course_ids)
+                if not course_ids:
+                    # Última rede: se existe UM ÚNICO curso publicado, a compra vale para ele.
                     cur.execute("SELECT id FROM courses WHERE is_published "
                                 "ORDER BY position, created_at LIMIT 2")
                     publicados = cur.fetchall()
@@ -1152,6 +1231,56 @@ def mapa_ofertas_remover(oferta: str = Query(...), authorization: str = Header(N
             apagou = cur.rowcount
         conn.commit()
         return {"ok": True, "removidos": apagou}
+    finally:
+        conn.close()
+
+
+class CursoOfertaIn(BaseModel):
+    course_id: str
+    ofertas: list[str] = []
+
+
+@router.post("/admin/curso-oferta")
+def curso_oferta(dados: CursoOfertaIn, authorization: str | None = Header(None)):
+    """Quais ofertas do gateway liberam ESTE curso (campo no cadastro do curso).
+
+    Mesmo dado da aba de liberação, digitado onde o dono já está: ele cola o hash da
+    oferta do OnProfit junto do curso e a venda seguinte já cai liberando — sem passo
+    extra e sem depender de nome de produto.
+    """
+    _exige_admin(authorization)
+    try:
+        UUID(dados.course_id)
+    except Exception:
+        raise HTTPException(status_code=422, detail="course_id invalido")
+    limpas = []
+    for oferta in dados.ofertas:
+        valor = (oferta or "").strip()
+        if valor and valor not in limpas:
+            limpas.append(valor)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM mapa_ofertas WHERE course_id = %s", (dados.course_id,))
+            for oferta in limpas:
+                cur.execute("INSERT INTO mapa_ofertas (oferta, course_id) VALUES (%s, %s) "
+                            "ON CONFLICT DO NOTHING", (oferta, dados.course_id))
+        conn.commit()
+        return {"ok": True, "course_id": dados.course_id, "ofertas": limpas}
+    finally:
+        conn.close()
+
+
+@router.get("/admin/curso-oferta")
+def curso_oferta_ver(course_id: str = Query(...), authorization: str | None = Header(None)):
+    """As ofertas já ligadas a um curso (é o que o formulário do curso mostra)."""
+    _exige_admin(authorization)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT oferta FROM mapa_ofertas WHERE course_id = %s ORDER BY oferta",
+                        (course_id,))
+            return {"ofertas": [l["oferta"] for l in cur.fetchall()]}
     finally:
         conn.close()
 
