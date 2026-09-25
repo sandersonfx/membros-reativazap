@@ -192,6 +192,8 @@ CREATE TABLE IF NOT EXISTS compras_gateway (
   oferta TEXT NOT NULL DEFAULT '',
   oferta_nome TEXT NOT NULL DEFAULT '',
   produto_hash TEXT NOT NULL DEFAULT '',
+  produto_id TEXT NOT NULL DEFAULT '',
+  chave TEXT NOT NULL DEFAULT '',
   produto_nome TEXT NOT NULL DEFAULT '',
   valor TEXT NOT NULL DEFAULT '',
   aplicado BOOLEAN NOT NULL DEFAULT FALSE,
@@ -200,6 +202,14 @@ CREATE TABLE IF NOT EXISTS compras_gateway (
   criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS compras_gateway_oferta_idx ON compras_gateway (oferta);
+-- A `chave` é a identidade que liga a compra ao curso. É o ID DO PRODUTO quando ele vem
+-- (um produto tem várias ofertas: checkout, página, afiliado), senão o hash do produto e,
+-- em último caso, o hash da oferta.
+ALTER TABLE compras_gateway ADD COLUMN IF NOT EXISTS produto_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE compras_gateway ADD COLUMN IF NOT EXISTS chave TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS compras_gateway_chave_idx ON compras_gateway (chave);
+UPDATE compras_gateway SET chave = COALESCE(NULLIF(produto_id, ''), NULLIF(produto_hash, ''), oferta)
+ WHERE chave = '';
 CREATE TABLE IF NOT EXISTS banners (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   titulo TEXT NOT NULL DEFAULT '',
@@ -719,7 +729,12 @@ def aplicar_compra(info):
     email = (info.get("email") or "").strip().lower()
     decisao = info.get("decisao") or "ignorar"
     origem = info.get("origem") or "onprofit"
-    chaves = [str(c) for c in (info.get("oferta"), info.get("produto_hash"), info.get("produto_id")) if c]
+    # Ordem de busca: ID do produto primeiro (vale para TODAS as ofertas daquele produto),
+    # depois o hash do produto, e o hash da oferta por último (vínculo antigo/legado).
+    chaves = [str(c).strip() for c in (info.get("produto_id"), info.get("produto_hash"),
+                                       info.get("oferta")) if c and str(c).strip()]
+    # Chave canônica: é a que fica gravada no extrato e a que o painel usa para religar.
+    chave = chaves[0] if chaves else ""
 
     conn = db()
     try:
@@ -744,7 +759,9 @@ def aplicar_compra(info):
                         achados = candidatos if len(candidatos) == 1 else []
                         como = "vinculado automaticamente pelo nome do produto"
                     if achados:
-                        _vincular(cur, chaves, achados)
+                        # Só a chave canônica é gravada: três chaves para o mesmo curso
+                        # apareceriam como três vínculos no painel.
+                        _vincular(cur, [chave], achados)
                         course_ids = [a["id"] for a in achados]
                         motivo = como
                         logger.info("compra %s: %s -> %s", decisao, como, course_ids)
@@ -765,21 +782,23 @@ def aplicar_compra(info):
 
             cur.execute("""INSERT INTO compras_gateway
                              (origem, status, decisao, email, nome, pedido, oferta, oferta_nome,
-                              produto_hash, produto_nome, valor, aplicado, motivo, cursos)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                              produto_hash, produto_id, chave, produto_nome, valor, aplicado,
+                              motivo, cursos)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                         (origem, str(info.get("status") or ""), decisao, email,
                          str(info.get("nome") or ""), str(info.get("pedido") or ""),
                          str(info.get("oferta") or ""), str(info.get("oferta_nome") or ""),
-                         str(info.get("produto_hash") or ""), str(info.get("produto_nome") or ""),
+                         str(info.get("produto_hash") or ""), str(info.get("produto_id") or ""),
+                         chave, str(info.get("produto_nome") or ""),
                          str(info.get("valor") if info.get("valor") is not None else ""),
                          aplicado, motivo, json.dumps(course_ids)))
         conn.commit()
-        logger.info("compra %s: email=%s oferta=%s cursos=%s aplicado=%s motivo=%s",
-                    decisao, email or "-", chaves[0] if chaves else "-", course_ids, aplicado,
-                    motivo or "ok")
+        logger.info("compra %s: email=%s chave=%s cursos=%s aplicado=%s motivo=%s",
+                    decisao, email or "-", chave or "-", course_ids, aplicado, motivo or "ok")
         if not aplicado:
-            return {"aplicado": False, "motivo": motivo, "ofertas": chaves, "cursos": []}
-        return {"aplicado": True, "cursos": course_ids, "motivo": motivo,
+            return {"aplicado": False, "motivo": motivo, "chave": chave, "ofertas": chaves,
+                    "cursos": []}
+        return {"aplicado": True, "cursos": course_ids, "motivo": motivo, "chave": chave,
                 "usuario_existia": usuario_existia}
     finally:
         conn.close()
@@ -1168,22 +1187,27 @@ def media_apagar(tipo: str, id: str, authorization: str = Header(None)):
 # ── admin ────────────────────────────────────────────────────────────────────
 
 class MapaIn(BaseModel):
-    oferta: str
+    chave: str | None = None          # ID do produto no gateway (forma certa hoje)
+    oferta: str | None = None         # nome antigo do campo, ainda aceito
     course_ids: list[str] = []
     course_id: str | None = None      # formato antigo (um curso só), ainda aceito
 
 
 @router.post("/admin/mapa-ofertas")
 def mapa_ofertas(dados: MapaIn, authorization: str = Header(None)):
-    """Diz quais cursos a oferta (OnProfit/Cakto) libera. Substitui o conjunto atual.
+    """Diz quais cursos esta chave do gateway (OnProfit/Cakto) libera. Substitui o conjunto atual.
+
+    A chave é o **ID do produto** — um produto tem várias ofertas (checkout, página,
+    afiliado), então amarrar à oferta deixaria venda de fora. O hash da oferta continua
+    aceito, para vínculo antigo.
 
     A lista inteira, não um curso por vez: é assim que uma compra de combo libera
-    vários cursos com uma oferta só.
+    vários cursos com uma chave só.
     """
     _exige_admin(authorization)
-    chave = dados.oferta.strip()
+    chave = (dados.chave or dados.oferta or "").strip()
     if not chave:
-        raise HTTPException(status_code=422, detail="informe a oferta")
+        raise HTTPException(status_code=422, detail="informe o id do produto")
     alvos = list(dados.course_ids) or ([dados.course_id] if dados.course_id else [])
     for cid in alvos:
         try:
@@ -1221,13 +1245,17 @@ def mapa_ofertas_listar(authorization: str = Header(None)):
 
 
 @router.delete("/admin/mapa-ofertas")
-def mapa_ofertas_remover(oferta: str = Query(...), authorization: str = Header(None)):
-    """Desfaz a ligacao oferta -> curso (a compra volta a nao liberar nada)."""
+def mapa_ofertas_remover(chave: str | None = Query(None), oferta: str | None = Query(None),
+                         authorization: str = Header(None)):
+    """Desfaz a ligacao chave -> curso (a compra volta a nao liberar nada)."""
     _exige_admin(authorization)
+    alvo = (chave or oferta or "").strip()
+    if not alvo:
+        raise HTTPException(status_code=422, detail="informe o id do produto")
     conn = db()
     try:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM mapa_ofertas WHERE oferta = %s", (oferta.strip(),))
+            cur.execute("DELETE FROM mapa_ofertas WHERE oferta = %s", (alvo,))
             apagou = cur.rowcount
         conn.commit()
         return {"ok": True, "removidos": apagou}
@@ -1237,16 +1265,17 @@ def mapa_ofertas_remover(oferta: str = Query(...), authorization: str = Header(N
 
 class CursoOfertaIn(BaseModel):
     course_id: str
-    ofertas: list[str] = []
+    chaves: list[str] = []            # IDs de produto do gateway
+    ofertas: list[str] = []           # nome antigo do campo, ainda aceito
 
 
 @router.post("/admin/curso-oferta")
 def curso_oferta(dados: CursoOfertaIn, authorization: str | None = Header(None)):
-    """Quais ofertas do gateway liberam ESTE curso (campo no cadastro do curso).
+    """Quais chaves do gateway liberam ESTE curso (campo no cadastro do curso).
 
-    Mesmo dado da aba de liberação, digitado onde o dono já está: ele cola o hash da
-    oferta do OnProfit junto do curso e a venda seguinte já cai liberando — sem passo
-    extra e sem depender de nome de produto.
+    A chave é o **ID do produto** do OnProfit: um produto tem várias ofertas (checkout,
+    página, afiliado) e todas precisam liberar o mesmo curso. Mesmo dado da aba de
+    liberação, digitado onde o dono já está.
     """
     _exige_admin(authorization)
     try:
@@ -1254,33 +1283,34 @@ def curso_oferta(dados: CursoOfertaIn, authorization: str | None = Header(None))
     except Exception:
         raise HTTPException(status_code=422, detail="course_id invalido")
     limpas = []
-    for oferta in dados.ofertas:
-        valor = (oferta or "").strip()
+    for chave in (dados.chaves + dados.ofertas):
+        valor = (chave or "").strip()
         if valor and valor not in limpas:
             limpas.append(valor)
     conn = db()
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM mapa_ofertas WHERE course_id = %s", (dados.course_id,))
-            for oferta in limpas:
+            for chave in limpas:
                 cur.execute("INSERT INTO mapa_ofertas (oferta, course_id) VALUES (%s, %s) "
-                            "ON CONFLICT DO NOTHING", (oferta, dados.course_id))
+                            "ON CONFLICT DO NOTHING", (chave, dados.course_id))
         conn.commit()
-        return {"ok": True, "course_id": dados.course_id, "ofertas": limpas}
+        return {"ok": True, "course_id": dados.course_id, "chaves": limpas, "ofertas": limpas}
     finally:
         conn.close()
 
 
 @router.get("/admin/curso-oferta")
 def curso_oferta_ver(course_id: str = Query(...), authorization: str | None = Header(None)):
-    """As ofertas já ligadas a um curso (é o que o formulário do curso mostra)."""
+    """As chaves já ligadas a um curso (é o que o formulário do curso mostra)."""
     _exige_admin(authorization)
     conn = db()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT oferta FROM mapa_ofertas WHERE course_id = %s ORDER BY oferta",
                         (course_id,))
-            return {"ofertas": [l["oferta"] for l in cur.fetchall()]}
+            lista = [l["oferta"] for l in cur.fetchall()]
+            return {"chaves": lista, "ofertas": lista}
     finally:
         conn.close()
 
@@ -1297,7 +1327,8 @@ def admin_compras(limite: int = 50, authorization: str = Header(None)):
     try:
         with conn.cursor() as cur:
             cur.execute("""SELECT origem, status, decisao, email, nome, pedido, oferta, oferta_nome,
-                                  produto_nome, valor, aplicado, motivo, cursos, criado_em
+                                  produto_id, produto_hash, chave, produto_nome, valor, aplicado,
+                                  motivo, cursos, criado_em
                            FROM compras_gateway ORDER BY criado_em DESC LIMIT %s""",
                         (max(1, min(int(limite or 50), 200)),))
             return {"compras": cur.fetchall()}
@@ -1317,7 +1348,10 @@ def admin_ofertas(authorization: str = Header(None)):
     conn = db()
     try:
         with conn.cursor() as cur:
-            cur.execute("""SELECT oferta,
+            cur.execute("""SELECT chave,
+                                  MAX(produto_id) AS produto_id,
+                                  MAX(produto_hash) AS produto_hash,
+                                  MAX(oferta) AS oferta,
                                   MAX(oferta_nome) AS oferta_nome,
                                   MAX(produto_nome) AS produto_nome,
                                   MAX(email) AS ultimo_email,
@@ -1325,22 +1359,23 @@ def admin_ofertas(authorization: str = Header(None)):
                                   COUNT(*) AS compras,
                                   COUNT(*) FILTER (WHERE decisao = 'liberar' AND NOT aplicado) AS pendentes,
                                   MAX(criado_em) AS ultima_em
-                             FROM compras_gateway WHERE oferta <> ''
-                            GROUP BY oferta ORDER BY MAX(criado_em) DESC""")
+                             FROM compras_gateway WHERE chave <> ''
+                            GROUP BY chave ORDER BY MAX(criado_em) DESC""")
             ofertas = cur.fetchall()
             cur.execute("""SELECT m.oferta, m.course_id, c.title FROM mapa_ofertas m
                            LEFT JOIN courses c ON c.id = m.course_id ORDER BY c.title""")
             mapa = cur.fetchall()
         for oferta in ofertas:
             oferta["cursos"] = [{"course_id": str(m["course_id"]), "title": m["title"]}
-                                for m in mapa if m["oferta"] == oferta["oferta"]]
+                                for m in mapa if m["oferta"] == oferta["chave"]]
         return {"ofertas": ofertas}
     finally:
         conn.close()
 
 
 class ReligarIn(BaseModel):
-    oferta: str
+    chave: str | None = None
+    oferta: str | None = None         # nome antigo do campo, ainda aceito
 
 
 @router.post("/admin/ofertas/aplicar")
@@ -1352,18 +1387,18 @@ def aplicar_pendentes_oferta(dados: ReligarIn, authorization: str = Header(None)
     preciso esperar a próxima venda nem lançar acesso na mão.
     """
     _exige_admin(authorization)
-    chave = dados.oferta.strip()
+    chave = (dados.chave or dados.oferta or "").strip()
     if not chave:
-        raise HTTPException(status_code=422, detail="informe a oferta")
+        raise HTTPException(status_code=422, detail="informe o id do produto")
     conn = db()
     try:
         with conn.cursor() as cur:
             course_ids = _cursos_da_oferta(cur, [chave])
             if not course_ids:
                 raise HTTPException(status_code=422,
-                                    detail="vincule a oferta a pelo menos um curso antes de religar")
+                                    detail="vincule o produto a pelo menos um curso antes de religar")
             cur.execute("""SELECT id, email, decisao, pedido FROM compras_gateway
-                           WHERE oferta = %s AND NOT aplicado AND email <> ''
+                           WHERE chave = %s AND NOT aplicado AND email <> ''
                              AND decisao IN ('liberar','revogar')
                            ORDER BY criado_em""", (chave,))
             compras = cur.fetchall()

@@ -479,8 +479,14 @@ def _interpretar_compra(payload):
     pedido = str(d.get("id") or d.get("order_id") or data.get("id") or "")
     oferta = str(d.get("offer_hash") or ofe.get("hash") or d.get("offer_id") or ofe.get("id") or "")
     oferta_nome = str(d.get("offer_name") or ofe.get("name") or "")
-    produto_hash = str(prod.get("hash") or dprod.get("hash") or "")
-    produto_nome = str(prod.get("name") or dprod.get("name") or "")
+    # O ID DO PRODUTO é a chave certa do vínculo: um produto tem VÁRIAS ofertas (checkout,
+    # página, afiliado), então amarrar o curso à oferta deixaria venda de fora. O hash do
+    # produto e o hash da oferta ficam como chave alternativa (vínculo antigo).
+    produto_id = str(prod.get("id") or dprod.get("id") or d.get("product_id")
+                     or data.get("product_id") or prod.get("productId")
+                     or dprod.get("productId") or "").strip()
+    produto_hash = str(prod.get("hash") or dprod.get("hash") or "").strip()
+    produto_nome = str(prod.get("name") or dprod.get("name") or "").strip()
     valor = d.get("price") or d.get("offer_price") or data.get("amount")
     moeda = str(d.get("currency") or "BRL")
 
@@ -506,7 +512,7 @@ def _interpretar_compra(payload):
 
     return {"status": status, "decisao": decisao, "email": email, "nome": nome, "telefone": fone,
             "pedido": pedido, "oferta": oferta, "oferta_nome": oferta_nome,
-            "produto_hash": produto_hash, "produto_nome": produto_nome,
+            "produto_id": produto_id, "produto_hash": produto_hash, "produto_nome": produto_nome,
             "valor": valor, "moeda": moeda, "dicas": dicas}
 
 
@@ -534,8 +540,8 @@ async def webhook_onprofit(request: Request):
 
     info = _interpretar_compra(payload)
     info["origem"] = "onprofit"
-    logger.info("ONPROFIT %s | %s | %s | oferta=%s produto=%s pedido=%s", info["status"], info["decisao"],
-                info["email"] or "SEM EMAIL", info["oferta"] or "-", info["produto_hash"] or "-",
+    logger.info("ONPROFIT %s | %s | %s | produto_id=%s oferta=%s pedido=%s", info["status"], info["decisao"],
+                info["email"] or "SEM EMAIL", info["produto_id"] or "-", info["oferta"] or "-",
                 info["pedido"] or "-")
     logger.info("ONPROFIT payload completo: %s", _json.dumps(payload, ensure_ascii=False)[:6000])
 
@@ -559,7 +565,8 @@ async def webhook_onprofit(request: Request):
             detalhe = "erro ao gravar: %s" % str(erro)[:150]
     return {"ok": True, "recebido": True, "status": info["status"], "decisao": info["decisao"],
             "email": info["email"], "nome": info["nome"], "oferta": info["oferta"],
-            "curso": curso, "aplicado": aplicado, "detalhe": detalhe}
+            "produto_id": info["produto_id"], "curso": curso, "aplicado": aplicado,
+            "detalhe": detalhe}
 
 
 @app.get("/webhook/onprofit/ultimo")
@@ -570,10 +577,10 @@ def onprofit_ultimo(key: str = Query(...)):
 
 @app.get("/admin/ultima-compra")
 def admin_ultima_compra(authorization: str = Header(None)):
-    """Ultimo pedido recebido do gateway. É daqui que sai a oferta para vincular.
+    """Ultimo pedido recebido do gateway. É daqui que sai a chave para vincular.
 
-    Sem isso o dono teria que copiar a oferta do painel do OnProfit na mão —
-    e é justamente o hash da oferta que liga a compra ao curso.
+    A chave é o **ID do produto** (um produto tem várias ofertas), então é esse valor
+    que o dono cola no curso — ou liga direto na aba de liberação.
     """
     _exige_admin_site(authorization)
     p = _ULTIMO_PAYLOAD
@@ -588,6 +595,7 @@ def admin_ultima_compra(authorization: str = Header(None)):
         "nome": p.get("nome"),
         "oferta": p.get("oferta"),
         "oferta_nome": p.get("oferta_nome"),
+        "produto_id": p.get("produto_id"),
         "produto_hash": p.get("produto_hash"),
         "produto_nome": p.get("produto_nome"),
         "pedido": p.get("pedido"),
