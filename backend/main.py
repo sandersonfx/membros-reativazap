@@ -41,7 +41,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # existem nos dois fluxos e a nova precisa ganhar. O fluxo antigo (tabela `alunas`,
 # senha temporária por WhatsApp) continua atendido — membros_api sabe migrar a aluna.
 from membros_api import router as site_router, criar_tabelas as _criar_tabelas_site, \
-    aplicar_compra as _aplicar_compra_site
+    aplicar_compra as _aplicar_compra_site, _exige_admin as _exige_admin_site
 app.include_router(site_router)
 
 
@@ -527,6 +527,7 @@ async def webhook_onprofit(request: Request):
     _ULTIMO_PAYLOAD.clear()
     _ULTIMO_PAYLOAD.update(info)
     _ULTIMO_PAYLOAD["payload"] = payload
+    _ULTIMO_PAYLOAD["visto_em"] = datetime.now(timezone.utc).isoformat()
 
     curso = None          # liga quando houver mapa oferta -> curso
     aplicado = False      # gravacao no banco do site
@@ -550,6 +551,33 @@ async def webhook_onprofit(request: Request):
 def onprofit_ultimo(key: str = Query(...)):
     _checar_admin(key)
     return _ULTIMO_PAYLOAD or {"vazio": True}
+
+
+@app.get("/admin/ultima-compra")
+def admin_ultima_compra(authorization: str = Header(None)):
+    """Ultimo pedido recebido do gateway. É daqui que sai a oferta para vincular.
+
+    Sem isso o dono teria que copiar a oferta do painel do OnProfit na mão —
+    e é justamente o hash da oferta que liga a compra ao curso.
+    """
+    _exige_admin_site(authorization)
+    p = _ULTIMO_PAYLOAD
+    if not p:
+        return {"vazio": True}
+    return {
+        "vazio": False,
+        "visto_em": p.get("visto_em"),
+        "status": p.get("status"),
+        "decisao": p.get("decisao"),
+        "email": p.get("email"),
+        "nome": p.get("nome"),
+        "oferta": p.get("oferta"),
+        "oferta_nome": p.get("oferta_nome"),
+        "produto_hash": p.get("produto_hash"),
+        "produto_nome": p.get("produto_nome"),
+        "pedido": p.get("pedido"),
+        "valor": p.get("valor"),
+    }
 
 
 if __name__ == "__main__":

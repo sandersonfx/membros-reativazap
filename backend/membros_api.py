@@ -1032,6 +1032,7 @@ def mapa_ofertas(dados: MapaIn, authorization: str = Header(None)):
 
 @router.get("/admin/mapa-ofertas")
 def mapa_ofertas_listar(authorization: str = Header(None)):
+    """Lista as ligacoes oferta -> curso (o que cada oferta libera)."""
     _exige_admin(authorization)
     conn = db()
     try:
@@ -1039,6 +1040,21 @@ def mapa_ofertas_listar(authorization: str = Header(None)):
             cur.execute("""SELECT m.oferta, m.course_id, c.title FROM mapa_ofertas m
                            LEFT JOIN courses c ON c.id = m.course_id ORDER BY m.criado_em""")
             return {"mapa": cur.fetchall()}
+    finally:
+        conn.close()
+
+
+@router.delete("/admin/mapa-ofertas")
+def mapa_ofertas_remover(oferta: str = Query(...), authorization: str = Header(None)):
+    """Desfaz a ligacao oferta -> curso (a compra volta a nao liberar nada)."""
+    _exige_admin(authorization)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM mapa_ofertas WHERE oferta = %s", (oferta.strip(),))
+            apagou = cur.rowcount
+        conn.commit()
+        return {"ok": True, "removidos": apagou}
     finally:
         conn.close()
 
