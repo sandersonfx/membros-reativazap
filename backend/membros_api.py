@@ -50,12 +50,13 @@ TABELAS = {
     "lessons":         {"tabela": "lessons",         "escopo": "module_id"},
     "enrollments":     {"tabela": "enrollments",     "escopo": "user_id"},
     "lesson_progress": {"tabela": "lesson_progress", "escopo": "user_id"},
+    "banners":         {"tabela": "banners",         "escopo": None},
 }
 # Tabelas em que o aluno comum pode gravar (só nas próprias linhas)
 ESCRITA_ALUNO = {"profiles": "id", "lesson_progress": "user_id"}
 APAGAR_ALUNO = {"lesson_progress"}
 # tabelas com coluna updated_at (enrollments e user_roles NÃO têm)
-TEM_UPDATED_AT = {"profiles", "courses", "modules", "lessons", "lesson_progress"}
+TEM_UPDATED_AT = {"profiles", "courses", "modules", "lessons", "lesson_progress", "banners"}
 # Relações que o front pede embutidas: select('*, lessons(*)')
 EMBEDS = {"modules": {"lessons": ("lessons", "module_id")},
           "courses": {"modules": ("modules", "course_id")}}
@@ -159,6 +160,17 @@ CREATE TABLE IF NOT EXISTS mapa_ofertas (
   oferta TEXT PRIMARY KEY,
   course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
   criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS banners (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  titulo TEXT NOT NULL DEFAULT '',
+  imagem_url TEXT,
+  link TEXT NOT NULL DEFAULT '',
+  local TEXT NOT NULL DEFAULT 'vitrine',
+  position INTEGER NOT NULL DEFAULT 0,
+  ativo BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ALTER TABLE courses  ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE lessons  ADD COLUMN IF NOT EXISTS is_free BOOLEAN NOT NULL DEFAULT FALSE;
@@ -627,6 +639,9 @@ def _escopo_aluno(tabela, usuario):
         return ["user_id = %s"], [me]
     if tabela == "lesson_progress":
         return ["user_id = %s"], [me]
+    if tabela == "banners":
+        # banner desligado é rascunho do admin: aluno só vê os ligados
+        return ["ativo = TRUE"], []
     return ["FALSE"], []
 
 
@@ -871,6 +886,7 @@ ALVOS_MIDIA = {
     "course":  ("courses", "cover_url"),
     "module":  ("modules", "cover_url"),
     "lesson":  ("lessons", "image_url"),
+    "banner":  ("banners", "imagem_url"),
     "profile": ("profiles", "avatar_url"),
     "usuario": ("profiles", "avatar_url"),
 }
@@ -890,7 +906,7 @@ async def media_upload(tipo: str = Form(...), id: str = Form(...),
     usuario = _exige_usuario(authorization)
     alvo = ALVOS_MIDIA.get((tipo or "").lower())
     if not alvo:
-        raise HTTPException(status_code=400, detail="tipo invalido (use course|module|lesson|profile)")
+        raise HTTPException(status_code=400, detail="tipo invalido (use course|module|lesson|banner|profile)")
     tabela, coluna = alvo
     if not usuario.get("is_admin") and not (tabela == "profiles" and str(id) == usuario["id"]):
         raise HTTPException(status_code=403, detail="somente admin")
