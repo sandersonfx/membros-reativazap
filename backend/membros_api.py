@@ -52,12 +52,13 @@ TABELAS = {
     "enrollments":     {"tabela": "enrollments",     "escopo": "user_id"},
     "lesson_progress": {"tabela": "lesson_progress", "escopo": "user_id"},
     "banners":         {"tabela": "banners",         "escopo": None},
+    "secoes":          {"tabela": "secoes",          "escopo": None},
 }
 # Tabelas em que o aluno comum pode gravar (só nas próprias linhas)
 ESCRITA_ALUNO = {"profiles": "id", "lesson_progress": "user_id"}
 APAGAR_ALUNO = {"lesson_progress"}
 # tabelas com coluna updated_at (enrollments e user_roles NÃO têm)
-TEM_UPDATED_AT = {"profiles", "courses", "modules", "lessons", "lesson_progress", "banners"}
+TEM_UPDATED_AT = {"profiles", "courses", "modules", "lessons", "lesson_progress", "banners", "secoes"}
 # Relações que o front pede embutidas: select('*, lessons(*)')
 EMBEDS = {"modules": {"lessons": ("lessons", "module_id")},
           "courses": {"modules": ("modules", "course_id")}}
@@ -90,7 +91,6 @@ CREATE TABLE IF NOT EXISTS courses (
   is_published BOOLEAN NOT NULL DEFAULT FALSE,
   show_in_catalog BOOLEAN NOT NULL DEFAULT TRUE,
   liberado_para_todos BOOLEAN NOT NULL DEFAULT FALSE,
-  secao TEXT NOT NULL DEFAULT '',
   position INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -177,7 +177,16 @@ CREATE TABLE IF NOT EXISTS banners (
 );
 ALTER TABLE courses  ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE courses  ADD COLUMN IF NOT EXISTS liberado_para_todos BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE courses  ADD COLUMN IF NOT EXISTS secao TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS secoes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  nome TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE courses  ADD COLUMN IF NOT EXISTS secao_id UUID REFERENCES secoes(id) ON DELETE SET NULL;
+-- a coluna de texto virou tabela de seções (nada tinha sido gravado nela ainda)
+ALTER TABLE courses  DROP COLUMN IF EXISTS secao;
 ALTER TABLE lessons  ADD COLUMN IF NOT EXISTS is_free BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE lessons  ADD COLUMN IF NOT EXISTS materials TEXT NOT NULL DEFAULT '[]';
 """
@@ -647,6 +656,9 @@ def _escopo_aluno(tabela, usuario):
         return ["user_id = %s"], [me]
     if tabela == "lesson_progress":
         return ["user_id = %s"], [me]
+    if tabela == "secoes":
+        # nome das seções é público: é o que dá título aos blocos da vitrine
+        return ["TRUE"], []
     if tabela == "banners":
         # banner desligado é rascunho do admin: aluno só vê os ligados
         return ["ativo = TRUE"], []
