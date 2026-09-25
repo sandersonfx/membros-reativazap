@@ -336,6 +336,7 @@ async def webhook_cakto(request: Request):
         # libera/revoga no banco do SITE (courses/enrollments) pelo email do comprador
         try:
             info_cakto = _interpretar_compra(payload)
+            info_cakto["origem"] = "cakto"
             if info_cakto.get("email"):
                 logger.info("CAKTO aplicado no site: %s", _aplicar_compra_site(info_cakto))
         except Exception:
@@ -519,6 +520,7 @@ async def webhook_onprofit(request: Request):
         payload = {"__bruto__": raw.decode("utf-8", "replace")[:4000]}
 
     info = _interpretar_compra(payload)
+    info["origem"] = "onprofit"
     logger.info("ONPROFIT %s | %s | %s | oferta=%s produto=%s pedido=%s", info["status"], info["decisao"],
                 info["email"] or "SEM EMAIL", info["oferta"] or "-", info["produto_hash"] or "-",
                 info["pedido"] or "-")

@@ -160,10 +160,46 @@ CREATE TABLE IF NOT EXISTS acessos_pendentes (
   UNIQUE (email, course_id)
 );
 CREATE TABLE IF NOT EXISTS mapa_ofertas (
-  oferta TEXT PRIMARY KEY,
+  oferta TEXT NOT NULL,
   course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (oferta, course_id)
+);
+-- Uma oferta precisa poder liberar VARIOS cursos (compra de combo). A chave primaria
+-- antiga era so `oferta`, o que travava isso no primeiro vinculo.
+DO $$
+DECLARE colunas text[];
+BEGIN
+  SELECT array_agg(a.attname ORDER BY a.attname) INTO colunas
+    FROM pg_constraint c
+    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+   WHERE c.conrelid = 'mapa_ofertas'::regclass AND c.contype = 'p';
+  IF colunas IS DISTINCT FROM ARRAY['course_id','oferta'] THEN
+    ALTER TABLE mapa_ofertas DROP CONSTRAINT IF EXISTS mapa_ofertas_pkey;
+    ALTER TABLE mapa_ofertas ADD PRIMARY KEY (oferta, course_id);
+  END IF;
+END $$;
+-- Toda compra que chega do gateway fica registrada aqui, inclusive a que ainda nao tem
+-- curso vinculado: sem esse registro a venda sumia sem deixar rastro.
+CREATE TABLE IF NOT EXISTS compras_gateway (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  origem TEXT NOT NULL DEFAULT 'onprofit',
+  status TEXT NOT NULL DEFAULT '',
+  decisao TEXT NOT NULL DEFAULT '',
+  email TEXT NOT NULL DEFAULT '',
+  nome TEXT NOT NULL DEFAULT '',
+  pedido TEXT NOT NULL DEFAULT '',
+  oferta TEXT NOT NULL DEFAULT '',
+  oferta_nome TEXT NOT NULL DEFAULT '',
+  produto_hash TEXT NOT NULL DEFAULT '',
+  produto_nome TEXT NOT NULL DEFAULT '',
+  valor TEXT NOT NULL DEFAULT '',
+  aplicado BOOLEAN NOT NULL DEFAULT FALSE,
+  motivo TEXT NOT NULL DEFAULT '',
+  cursos TEXT NOT NULL DEFAULT '[]',
   criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS compras_gateway_oferta_idx ON compras_gateway (oferta);
 CREATE TABLE IF NOT EXISTS banners (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   titulo TEXT NOT NULL DEFAULT '',
@@ -570,63 +606,102 @@ def _liberar_pendentes(cur, email, user_id):
     return len(liberados)
 
 
-def aplicar_compra(info):
-    """Decisão do webhook -> banco. Libera/revoga o curso pelo EMAIL do comprador."""
-    email = (info.get("email") or "").strip().lower()
-    decisao = info.get("decisao")
-    if not email or decisao not in ("liberar", "revogar"):
-        return {"aplicado": False, "motivo": "sem email ou decisao ignorada"}
+def _cursos_da_oferta(cur, chaves):
+    """Cursos ligados a quaisquer chaves (oferta/produto) do payload, sem repetir."""
+    ids, vistos = [], set()
+    for chave in chaves:
+        cur.execute("SELECT course_id FROM mapa_ofertas WHERE oferta = %s", (chave,))
+        for linha in cur.fetchall():
+            cid = str(linha["course_id"])
+            if cid not in vistos:
+                vistos.add(cid)
+                ids.append(cid)
+    return ids
 
+
+def _aplicar_para_email(cur, email, decisao, course_ids, origem="webhook", pedido=""):
+    """Libera (ou revoga) os cursos para o e-mail do comprador.
+
+    Comprador sem conta não perde a compra: fica em `acessos_pendentes` e o acesso
+    entra no primeiro login com esse e-mail.
+    """
+    linha = _usuario_por_email(cur, email)
+    if decisao == "liberar":
+        if linha:
+            for cid in course_ids:
+                cur.execute("INSERT INTO enrollments (user_id, course_id) VALUES (%s, %s) "
+                            "ON CONFLICT DO NOTHING", (str(linha["id"]), cid))
+        else:
+            for cid in course_ids:
+                cur.execute("""INSERT INTO acessos_pendentes (email, course_id, origem, pedido_id)
+                               VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING""",
+                            (email, cid, origem, pedido))
+    else:
+        if linha:
+            for cid in course_ids:
+                cur.execute("DELETE FROM enrollments WHERE user_id = %s AND course_id = %s",
+                            (str(linha["id"]), cid))
+        for cid in course_ids:
+            cur.execute("DELETE FROM acessos_pendentes WHERE email = %s AND course_id = %s",
+                        (email, cid))
+    return bool(linha)
+
+
+def aplicar_compra(info):
+    """Decisão do webhook -> banco. Libera/revoga o curso pelo EMAIL do comprador.
+
+    Toda compra passa por `compras_gateway`, inclusive a que ainda não tem curso
+    vinculado. É esse registro que permite ver a oferta chegando, dizer quantas
+    compras ficaram pendentes e religar a venda depois, sem perder quem já pagou.
+    """
+    email = (info.get("email") or "").strip().lower()
+    decisao = info.get("decisao") or "ignorar"
+    origem = info.get("origem") or "onprofit"
     chaves = [str(c) for c in (info.get("oferta"), info.get("produto_hash"), info.get("produto_id")) if c]
-    if not chaves:
-        return {"aplicado": False, "motivo": "payload sem oferta/produto identificavel"}
 
     conn = db()
     try:
         with conn.cursor() as cur:
-            course_ids = []
-            for chave in chaves:
-                cur.execute("SELECT course_id FROM mapa_ofertas WHERE oferta = %s", (chave,))
-                course_ids += [str(l["course_id"]) for l in cur.fetchall()]
-            if not course_ids:
-                # Sem mapa cadastrado: se existe UM UNICO curso publicado, a compra vale para ele.
-                # Assim o gateway funciona sem depender do offer_hash quando so ha um curso.
-                cur.execute("SELECT id FROM courses WHERE is_published "
-                            "ORDER BY position, created_at LIMIT 2")
-                publicados = cur.fetchall()
-                if len(publicados) == 1:
-                    course_ids = [str(publicados[0]["id"])]
-                    logger.info("compra %s: sem mapa; aplicando no unico curso publicado %s",
-                                decisao, course_ids[0])
-                else:
-                    logger.warning("compra %s: oferta(s) %s sem mapa -> curso (%d curso(s) publicado(s))",
-                                   decisao, chaves, len(publicados))
-                    return {"aplicado": False, "motivo": "oferta sem mapa para curso",
-                            "ofertas": chaves, "cursos_publicados": len(publicados)}
-
-            linha = _usuario_por_email(cur, email)
-            if decisao == "liberar":
-                if linha:
-                    for cid in course_ids:
-                        cur.execute("INSERT INTO enrollments (user_id, course_id) VALUES (%s, %s) "
-                                    "ON CONFLICT DO NOTHING", (str(linha["id"]), cid))
-                else:
-                    for cid in course_ids:
-                        cur.execute("""INSERT INTO acessos_pendentes (email, course_id, origem, pedido_id)
-                                       VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING""",
-                                    (email, cid, info.get("origem") or "webhook", str(info.get("pedido") or "")))
+            course_ids, motivo, aplicado, usuario_existia = [], "", False, False
+            if not email or decisao not in ("liberar", "revogar"):
+                motivo = "sem email ou decisao ignorada"
+            elif not chaves:
+                motivo = "payload sem oferta/produto identificavel"
             else:
-                if linha:
-                    for cid in course_ids:
-                        cur.execute("DELETE FROM enrollments WHERE user_id = %s AND course_id = %s",
-                                    (str(linha["id"]), cid))
-                for cid in course_ids:
-                    cur.execute("DELETE FROM acessos_pendentes WHERE email = %s AND course_id = %s",
-                                (email, cid))
+                course_ids = _cursos_da_oferta(cur, chaves)
+                if not course_ids:
+                    # Sem vínculo: se existe UM ÚNICO curso publicado, a compra vale para ele.
+                    cur.execute("SELECT id FROM courses WHERE is_published "
+                                "ORDER BY position, created_at LIMIT 2")
+                    publicados = cur.fetchall()
+                    if len(publicados) == 1:
+                        course_ids = [str(publicados[0]["id"])]
+                        motivo = "sem vinculo: aplicado no unico curso publicado"
+                    else:
+                        motivo = "oferta sem curso vinculado"
+                if course_ids:
+                    usuario_existia = _aplicar_para_email(cur, email, decisao, course_ids, origem,
+                                                          str(info.get("pedido") or ""))
+                    aplicado = True
+
+            cur.execute("""INSERT INTO compras_gateway
+                             (origem, status, decisao, email, nome, pedido, oferta, oferta_nome,
+                              produto_hash, produto_nome, valor, aplicado, motivo, cursos)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (origem, str(info.get("status") or ""), decisao, email,
+                         str(info.get("nome") or ""), str(info.get("pedido") or ""),
+                         str(info.get("oferta") or ""), str(info.get("oferta_nome") or ""),
+                         str(info.get("produto_hash") or ""), str(info.get("produto_nome") or ""),
+                         str(info.get("valor") if info.get("valor") is not None else ""),
+                         aplicado, motivo, json.dumps(course_ids)))
         conn.commit()
-        logger.info("compra %s: email=%s cursos=%s usuario=%s", decisao, email, course_ids,
-                    "existia" if linha else "novo (pendente)")
-        return {"aplicado": True, "cursos": course_ids, "usuario_existia": bool(linha)}
+        logger.info("compra %s: email=%s oferta=%s cursos=%s aplicado=%s motivo=%s",
+                    decisao, email or "-", chaves[0] if chaves else "-", course_ids, aplicado,
+                    motivo or "ok")
+        if not aplicado:
+            return {"aplicado": False, "motivo": motivo, "ofertas": chaves, "cursos": []}
+        return {"aplicado": True, "cursos": course_ids, "motivo": motivo,
+                "usuario_existia": usuario_existia}
     finally:
         conn.close()
 
@@ -1015,29 +1090,39 @@ def media_apagar(tipo: str, id: str, authorization: str = Header(None)):
 
 class MapaIn(BaseModel):
     oferta: str
-    course_id: str
+    course_ids: list[str] = []
+    course_id: str | None = None      # formato antigo (um curso só), ainda aceito
 
 
 @router.post("/admin/mapa-ofertas")
 def mapa_ofertas(dados: MapaIn, authorization: str = Header(None)):
-    """Liga o hash/id da oferta (OnProfit/Cakto) ao curso que ela libera."""
+    """Diz quais cursos a oferta (OnProfit/Cakto) libera. Substitui o conjunto atual.
+
+    A lista inteira, não um curso por vez: é assim que uma compra de combo libera
+    vários cursos com uma oferta só.
+    """
     _exige_admin(authorization)
-    try:
-        UUID(dados.course_id)
-    except Exception:
-        raise HTTPException(status_code=422, detail="course_id invalido")
+    chave = dados.oferta.strip()
+    if not chave:
+        raise HTTPException(status_code=422, detail="informe a oferta")
+    alvos = list(dados.course_ids) or ([dados.course_id] if dados.course_id else [])
+    for cid in alvos:
+        try:
+            UUID(str(cid))
+        except Exception:
+            raise HTTPException(status_code=422, detail="course_id invalido: %s" % cid)
     conn = db()
     try:
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO mapa_ofertas (oferta, course_id) VALUES (%s, %s)
-                           ON CONFLICT (oferta) DO UPDATE SET course_id = EXCLUDED.course_id
-                           RETURNING oferta, course_id""", (dados.oferta.strip(), dados.course_id))
-            linha = cur.fetchone()
-            cur.execute("SELECT title FROM courses WHERE id = %s", (dados.course_id,))
-            curso = cur.fetchone()
+            cur.execute("DELETE FROM mapa_ofertas WHERE oferta = %s", (chave,))
+            for cid in alvos:
+                cur.execute("INSERT INTO mapa_ofertas (oferta, course_id) VALUES (%s, %s) "
+                            "ON CONFLICT DO NOTHING", (chave, cid))
+            cur.execute("""SELECT c.title FROM mapa_ofertas m JOIN courses c ON c.id = m.course_id
+                           WHERE m.oferta = %s ORDER BY c.title""", (chave,))
+            titulos = [l["title"] for l in cur.fetchall()]
         conn.commit()
-        return {"ok": True, "mapa": {"oferta": linha["oferta"], "course_id": str(linha["course_id"]),
-                                     "curso": (curso or {}).get("title")}}
+        return {"ok": True, "oferta": chave, "cursos": titulos}
     finally:
         conn.close()
 
@@ -1067,6 +1152,103 @@ def mapa_ofertas_remover(oferta: str = Query(...), authorization: str = Header(N
             apagou = cur.rowcount
         conn.commit()
         return {"ok": True, "removidos": apagou}
+    finally:
+        conn.close()
+
+
+@router.get("/admin/compras")
+def admin_compras(limite: int = 50, authorization: str = Header(None)):
+    """Toda compra recebida do gateway, aplicada ou não.
+
+    É o extrato que garante que nenhuma venda se perca quando a oferta ainda não
+    estava vinculada a um curso.
+    """
+    _exige_admin(authorization)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT origem, status, decisao, email, nome, pedido, oferta, oferta_nome,
+                                  produto_nome, valor, aplicado, motivo, cursos, criado_em
+                           FROM compras_gateway ORDER BY criado_em DESC LIMIT %s""",
+                        (max(1, min(int(limite or 50), 200)),))
+            return {"compras": cur.fetchall()}
+    finally:
+        conn.close()
+
+
+@router.get("/admin/ofertas")
+def admin_ofertas(authorization: str = Header(None)):
+    """Ofertas que já chegaram pelo webhook, com o que já está vinculado.
+
+    É a lista que tira a adivinhação: a oferta aparece aqui com o nome do produto
+    do gateway mesmo antes de estar ligada a um curso. Se o nome não vier no
+    payload, o dono reconhece pelo valor e pelo e-mail de quem comprou.
+    """
+    _exige_admin(authorization)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT oferta,
+                                  MAX(oferta_nome) AS oferta_nome,
+                                  MAX(produto_nome) AS produto_nome,
+                                  MAX(email) AS ultimo_email,
+                                  MAX(valor) AS valor,
+                                  COUNT(*) AS compras,
+                                  COUNT(*) FILTER (WHERE decisao = 'liberar' AND NOT aplicado) AS pendentes,
+                                  MAX(criado_em) AS ultima_em
+                             FROM compras_gateway WHERE oferta <> ''
+                            GROUP BY oferta ORDER BY MAX(criado_em) DESC""")
+            ofertas = cur.fetchall()
+            cur.execute("""SELECT m.oferta, m.course_id, c.title FROM mapa_ofertas m
+                           LEFT JOIN courses c ON c.id = m.course_id ORDER BY c.title""")
+            mapa = cur.fetchall()
+        for oferta in ofertas:
+            oferta["cursos"] = [{"course_id": str(m["course_id"]), "title": m["title"]}
+                                for m in mapa if m["oferta"] == oferta["oferta"]]
+        return {"ofertas": ofertas}
+    finally:
+        conn.close()
+
+
+class ReligarIn(BaseModel):
+    oferta: str
+
+
+@router.post("/admin/ofertas/aplicar")
+def aplicar_pendentes_oferta(dados: ReligarIn, authorization: str = Header(None)):
+    """Religa as compras que ficaram pendentes por falta de vínculo.
+
+    Percorre as compras ainda não aplicadas dessa oferta na ordem em que chegaram e
+    aplica cada uma (libera quem pagou, revoga quem estornou). Existe para não ser
+    preciso esperar a próxima venda nem lançar acesso na mão.
+    """
+    _exige_admin(authorization)
+    chave = dados.oferta.strip()
+    if not chave:
+        raise HTTPException(status_code=422, detail="informe a oferta")
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            course_ids = _cursos_da_oferta(cur, [chave])
+            if not course_ids:
+                raise HTTPException(status_code=422,
+                                    detail="vincule a oferta a pelo menos um curso antes de religar")
+            cur.execute("""SELECT id, email, decisao, pedido FROM compras_gateway
+                           WHERE oferta = %s AND NOT aplicado AND email <> ''
+                             AND decisao IN ('liberar','revogar')
+                           ORDER BY criado_em""", (chave,))
+            compras = cur.fetchall()
+            emails = []
+            for compra in compras:
+                _aplicar_para_email(cur, compra["email"], compra["decisao"], course_ids,
+                                    "religar", str(compra["pedido"] or ""))
+                cur.execute("""UPDATE compras_gateway SET aplicado = TRUE,
+                                      motivo = 'religado pelo painel', cursos = %s WHERE id = %s""",
+                            (json.dumps(course_ids), compra["id"]))
+                emails.append(compra["email"])
+        conn.commit()
+        return {"ok": True, "compras_aplicadas": len(compras), "cursos": course_ids,
+                "emails": sorted(set(emails))}
     finally:
         conn.close()
 
