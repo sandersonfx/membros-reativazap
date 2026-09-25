@@ -17,6 +17,7 @@ do main.py, senão o uvicorn.run bloqueia e a rota não existe em produção.
 """
 import os
 import re
+import json
 import secrets
 import logging
 from datetime import datetime, timedelta, timezone
@@ -107,6 +108,7 @@ CREATE TABLE IF NOT EXISTS lessons (
   description TEXT NOT NULL DEFAULT '',
   youtube_url TEXT NOT NULL DEFAULT '',
   image_url TEXT,
+  materials TEXT NOT NULL DEFAULT '[]',
   duration_minutes INTEGER NOT NULL DEFAULT 0,
   position INTEGER NOT NULL DEFAULT 0,
   is_published BOOLEAN NOT NULL DEFAULT FALSE,
@@ -160,6 +162,7 @@ CREATE TABLE IF NOT EXISTS mapa_ofertas (
 );
 ALTER TABLE courses  ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE lessons  ADD COLUMN IF NOT EXISTS is_free BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE lessons  ADD COLUMN IF NOT EXISTS materials TEXT NOT NULL DEFAULT '[]';
 """
 
 
@@ -669,6 +672,34 @@ def _filtro_obrigatorio(where):
         raise HTTPException(status_code=400, detail="operacao sem filtro recusada")
 
 
+def _normalizar_materiais(valor):
+    """Materiais da aula vêm como lista de {label, url} e viram texto JSON.
+
+    Aula só de material é legítima: `youtube_url` vazio + materiais preenchidos.
+    Qualquer coisa estranha vira lista vazia, nunca quebra a gravação.
+    """
+    if valor is None:
+        return "[]"
+    itens = valor
+    if isinstance(valor, str):
+        try:
+            itens = json.loads(valor or "[]")
+        except Exception:
+            return "[]"
+    if not isinstance(itens, list):
+        return "[]"
+    limpos = []
+    for item in itens:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        limpos.append({"label": str(item.get("label") or "").strip()[:120],
+                       "url": url[:1000]})
+    return json.dumps(limpos, ensure_ascii=False)
+
+
 @router.api_route("/api/db/{tabela}", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
 async def api_db(tabela: str, request: Request, authorization: str = Header(None)):
     usuario = _exige_usuario(authorization)
@@ -747,7 +778,11 @@ async def api_db(tabela: str, request: Request, authorization: str = Header(None
                 if tabela == "lessons":
                     if not (linha.get("title") or "").strip():
                         raise HTTPException(status_code=422, detail="aula sem titulo")
-                    linha["youtube_url"] = linha.get("youtube_url") or ""
+                    # só mexe no que veio no corpo: PATCH de um campo não pode apagar o vídeo
+                    if "youtube_url" in linha:
+                        linha["youtube_url"] = linha.get("youtube_url") or ""
+                    if "materials" in linha:
+                        linha["materials"] = _normalizar_materiais(linha["materials"])
                 return linha
 
             gravadas = []
